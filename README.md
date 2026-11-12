@@ -7,7 +7,8 @@
 ## Installation
 
 ```bash
-wget https://github.com/cruxthorn/rvsdns/releases/latest/download/rvsdns
+wget -qO- https://github.com/cruxthorn/rvsdns/releases/download/v1.0.0/rvsdns-linux-x86_64.tar.gz \
+  | sudo tar -xz -C /usr/local/bin
 ```
 
 ## Usage
