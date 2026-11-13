@@ -10,11 +10,12 @@ use std::{
 };
 
 use futures::{Stream, StreamExt, stream};
-use hickory_net::runtime::TokioRuntimeProvider;
+use hickory_net::{NetError, runtime::TokioRuntimeProvider};
 use hickory_proto::rr::RData;
 use hickory_resolver::{
     Resolver, TokioResolver,
     config::{NameServerConfig, ResolverConfig},
+    lookup::Lookup,
 };
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
@@ -104,8 +105,8 @@ impl Limiter {
         }
     }
 
-    /// Multiplicative decrease, once per congestion event.
-    fn on_timeout(&self, seen: usize) {
+    /// Multiplicative decrease on any loss signal, once per congestion event.
+    fn on_backoff(&self, seen: usize) {
         let _ = self
             .limit
             .compare_exchange(seen, (seen * 7 / 8).max(MIN_CON), Relaxed, Relaxed);
@@ -126,6 +127,7 @@ struct Meter {
     sum_us: AtomicU64,
     n: AtomicU64,
     tmo: AtomicU64,
+    err: AtomicU64,
 }
 
 impl Meter {
@@ -155,9 +157,50 @@ impl Meter {
     fn avg_ms(&self) -> f64 {
         self.sum_us.load(Relaxed) as f64 / self.n.load(Relaxed).max(1) as f64 / 1000.0
     }
+
+    fn fail(&self, cause: Cause) {
+        match cause {
+            Cause::Timeout => self.tmo.fetch_add(1, Relaxed),
+            Cause::Server => self.err.fetch_add(1, Relaxed),
+        };
+    }
 }
 
 // ─────────────────────── resolver ───────────────────────
+
+
+/// What one attempt told us.
+enum Attempt {
+    /// Valid reply, final. Empty = NXDOMAIN/NODATA.
+    Reply(Vec<String>),
+    /// No usable reply; back off and try again.
+    Retry(Cause),
+}
+
+#[derive(Clone, Copy)]
+enum Cause {
+    Timeout, // our deadline or the resolver's own
+    Server,  // SERVFAIL, REFUSED, busy, I/O, protocol...
+}
+
+fn ptr_names(l: &Lookup) -> Vec<String> {
+    l.answers()
+        .iter()
+        .filter_map(|rec| match &rec.data {
+            RData::PTR(p) => Some(p.0.to_utf8().trim_end_matches('.').to_owned()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn classify(res: Result<Lookup, NetError>) -> Attempt {
+    match res {
+        Ok(l) => Attempt::Reply(ptr_names(&l)),
+        Err(e) if e.is_no_records_found() => Attempt::Reply(vec![]),
+        Err(NetError::Timeout) => Attempt::Retry(Cause::Timeout),
+        Err(_) => Attempt::Retry(Cause::Server),
+    }
+}
 
 fn build_resolver() -> TokioResolver {
     let ns = RESOLVERS.iter().map(|&ip| NameServerConfig::udp_and_tcp(ip)).collect();
@@ -166,47 +209,43 @@ fn build_resolver() -> TokioResolver {
         TokioRuntimeProvider::default(),
     );
     let o = b.options_mut();
-    o.cache_size = 0; // every IP is unique (deduped)
+    o.cache_size = 0;
+    o.num_concurrent_reqs = 1; // one request per query
     o.timeout = MAX_TIMEOUT * 2; // outer adaptive timeout always fires first
-    o.attempts = 1; // retries are ours
+    o.attempts = 0; // retries are ours
     b.build().expect("cannot build resolver")
 }
 
+/// `None` = gave up after MAX_TRIES (distinct from a valid "no PTR" reply).
 async fn lookup(
     r: &TokioResolver,
     lim: &Limiter,
     meter: &Meter,
     ip: IpAddr,
-) -> (IpAddr, Vec<String>) {
+) -> (IpAddr, Option<Vec<String>>) {
     let (permit, seen) = lim.acquire().await;
-    let mut names = vec![];
+    let mut result = None;
     for _ in 0..MAX_TRIES {
         let t0 = Instant::now();
-        match tokio::time::timeout(meter.timeout(), r.reverse_lookup(ip)).await {
-            Ok(res) => {
+        let attempt = match tokio::time::timeout(meter.timeout(), r.reverse_lookup(ip)).await {
+            Ok(res) => classify(res),
+            Err(_) => Attempt::Retry(Cause::Timeout),
+        };
+        match attempt {
+            Attempt::Reply(names) => {
                 meter.record(t0.elapsed());
                 lim.on_success();
-                names = res
-                .map(|l| {
-                    l.answers()
-                        .iter()
-                        .filter_map(|rec| match &rec.data {
-                            RData::PTR(p) => Some(p.0.to_utf8().trim_end_matches('.').to_owned()),
-                            _ => None,
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-                break; // NXDOMAIN / no records is final, only timeouts retry
+                result = Some(names);
+                break;
             }
-            Err(_) => {
-                meter.tmo.fetch_add(1, Relaxed);
-                lim.on_timeout(seen)
+            Attempt::Retry(cause) => {
+                meter.fail(cause);
+                lim.on_backoff(seen);
             }
         }
     }
     lim.release(permit);
-    (ip, names)
+    (ip, result)
 }
 
 fn emit(w: &mut impl Write, ip: IpAddr, names: &[String]) -> io::Result<()> {
@@ -225,7 +264,7 @@ async fn main() {
     let resolver = build_resolver();
     let (lim, meter) = (Limiter::new(), Meter::default());
     let started = Instant::now();
-    let (mut inp, mut out) = (0u64, 0u64);
+    let (mut inp, mut out, mut fail) = (0u64, 0u64, 0u64);
 
     let mut w = BufWriter::new(io::stdout().lock());
     let mut results = pin!(
@@ -234,8 +273,12 @@ async fn main() {
             .buffer_unordered(MAX_CON)
     );
 
-    while let Some((ip, names)) = results.next().await {
+    while let Some((ip, res)) = results.next().await {
         inp += 1;
+        let Some(names) = res else {
+            fail += 1;
+            continue;
+        };
         out += u64::from(!names.is_empty());
         if emit(&mut w, ip, &names).is_err() {
             break; // e.g. broken pipe (| head)
@@ -248,10 +291,11 @@ async fn main() {
     let _ = w.flush();
 
     eprintln!(
-        "\nInp: {inp} | Out: {out} | Time: {:.3}s | Lat: {:.3}ms | Con: {} | Tmo: {}",
+        "\nInp: {inp} | Out: {out} | Fail: {fail} | Time: {:.3}s | Lat: {:.3}ms | Con: {} | Tmo: {} | Err: {}",
         started.elapsed().as_secs_f64(),
         meter.avg_ms(),
         lim.avg_con(),
-        meter.tmo.load(Relaxed)
+        meter.tmo.load(Relaxed),
+        meter.err.load(Relaxed),
     );
 }
