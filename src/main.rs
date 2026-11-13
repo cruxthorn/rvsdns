@@ -1,8 +1,7 @@
 //! rvsdns — reverse DNS lookup, input via STDIN only.
-//! Pipeline: STDIN -> (parse|expand CIDR) -> dedupe -> adaptive resolve -> STDOUT. Bench -> STDERR.
+//! Pipeline: STDIN -> parse -> adaptive resolve -> STDOUT. Bench -> STDERR.
 
 use std::{
-    collections::HashSet,
     io::{self, BufWriter, IsTerminal, Write},
     net::{IpAddr, Ipv4Addr},
     pin::pin,
@@ -17,20 +16,19 @@ use hickory_resolver::{
     Resolver, TokioResolver,
     config::{NameServerConfig, ResolverConfig},
 };
-use ipnet::IpNet;
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     sync::{Semaphore, SemaphorePermit},
 };
 
-const MIN_CON: usize = 32;
-const START_CON: usize = 48;
-const MAX_CON: usize = 512;
-const MAX_TRIES: usize = 2; // 1 attempt + max 1 retries
+const MIN_CON: usize = 256;
+const START_CON: usize = 512;
+const MAX_CON: usize = 4096; // ulimit -n 65535
+const MAX_TRIES: usize = 3; // 1 attempt + max 2 retries
 
 const BOOT_TIMEOUT: Duration = Duration::from_millis(1500);
 const MIN_TIMEOUT: Duration = Duration::from_millis(800);
-const MAX_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_TIMEOUT: Duration = Duration::from_millis(2500);
 
 const USAGE: &str = "rvsdns - fast reverse DNS lookup (Direct STDIN only)\n";
 const RESOLVERS: [IpAddr; 4] = [
@@ -44,7 +42,7 @@ const RESOLVERS: [IpAddr; 4] = [
 
 // ───────────────────────── input ─────────────────────────
 
-/// Streaming STDIN, blank/invalid lines dropped, duplicates dropped.
+/// Streaming STDIN, blank/invalid lines dropped.
 fn ips() -> impl Stream<Item = IpAddr> {
     let lines = BufReader::new(tokio::io::stdin()).lines();
     stream::unfold(lines, |mut l| async move {
@@ -52,10 +50,6 @@ fn ips() -> impl Stream<Item = IpAddr> {
         Some((s, l))
     })
     .filter_map(|line| std::future::ready(line.trim().parse::<IpAddr>().ok()))
-    .scan(HashSet::new(), |seen, ip| {
-        std::future::ready(Some(seen.insert(ip).then_some(ip)))
-    })
-    .filter_map(std::future::ready)
 }
 
 
