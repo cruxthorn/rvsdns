@@ -44,15 +44,6 @@ const RESOLVERS: [IpAddr; 4] = [
 
 // ───────────────────────── input ─────────────────────────
 
-/// IP literal or CIDR -> lazy IP iterator. Invalid input yields nothing.
-fn expand(line: &str) -> impl Iterator<Item = IpAddr> + use<> {
-    let s = line.trim();
-    s.parse::<IpAddr>()
-        .ok()
-        .into_iter()
-        .chain(s.parse::<IpNet>().ok().into_iter().flat_map(|n| n.hosts()))
-}
-
 /// Streaming STDIN, blank/invalid lines dropped, duplicates dropped.
 fn ips() -> impl Stream<Item = IpAddr> {
     let lines = BufReader::new(tokio::io::stdin()).lines();
@@ -60,7 +51,7 @@ fn ips() -> impl Stream<Item = IpAddr> {
         let s = l.next_line().await.ok()??;
         Some((s, l))
     })
-    .flat_map(|line| stream::iter(expand(&line)))
+    .filter_map(|line| std::future::ready(line.trim().parse::<IpAddr>().ok()))
     .scan(HashSet::new(), |seen, ip| {
         std::future::ready(Some(seen.insert(ip).then_some(ip)))
     })
