@@ -790,7 +790,6 @@ dependencies = [
  "hickory-net",
  "hickory-proto",
  "hickory-resolver",
- "ipnet",
  "tokio",
 ]
 
