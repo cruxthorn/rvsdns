@@ -32,13 +32,27 @@ const MIN_TIMEOUT: Duration = Duration::from_millis(800);
 const MAX_TIMEOUT: Duration = Duration::from_millis(2500);
 
 const USAGE: &str = "rvsdns - fast reverse DNS lookup (Direct STDIN only)\n";
-const RESOLVERS: [IpAddr; 4] = [
+const RESOLVERS: [IpAddr; 10] = [
     // Cloudflare
     IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
-    IpAddr::V4(Ipv4Addr::new(1, 0, 0, 1)),
     // Google
     IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
-    IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4)),
+    // Quad9
+    IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)),
+    // OpenDNS
+    IpAddr::V4(Ipv4Addr::new(208, 67, 222, 222)),
+    // AdGuard
+    IpAddr::V4(Ipv4Addr::new(94, 140, 14, 14)),
+    // CleanBrowsing
+    IpAddr::V4(Ipv4Addr::new(185, 228, 168, 9)),
+    // Control D
+    IpAddr::V4(Ipv4Addr::new(76, 76, 2, 0)),
+    // Verisign
+    IpAddr::V4(Ipv4Addr::new(64, 6, 64, 6)),
+    // DNS.WATCH
+    IpAddr::V4(Ipv4Addr::new(84, 200, 69, 80)),
+    // DNS4EU
+    IpAddr::V4(Ipv4Addr::new(86, 54, 11, 1)),
 ];
 
 // ───────────────────────── input ─────────────────────────
@@ -202,44 +216,108 @@ fn classify(res: Result<Lookup, NetError>) -> Attempt {
     }
 }
 
-fn build_resolver() -> TokioResolver {
-    let ns = RESOLVERS.iter().map(|&ip| NameServerConfig::udp_and_tcp(ip)).collect();
-    let mut b = Resolver::builder_with_config(
-        ResolverConfig::from_name_servers(ns),
-        TokioRuntimeProvider::default(),
-    );
+const _: () = assert!(RESOLVERS.len() <= 64); // `tried` is a u64 bitmask
+
+fn build_resolver(ip: IpAddr) -> TokioResolver {
+    let config = ResolverConfig::from_name_servers(vec![NameServerConfig::udp_and_tcp(ip)]);
+    let mut b = Resolver::builder_with_config(config, TokioRuntimeProvider::default());
     let o = b.options_mut();
     o.cache_size = 0;
-    o.num_concurrent_reqs = 1; // one request per query
     o.timeout = MAX_TIMEOUT * 2; // outer adaptive timeout always fires first
-    o.attempts = 0; // retries are ours
+    o.attempts = 0; // retries are ours, on another server
     b.build().expect("cannot build resolver")
 }
 
-/// `None` = gave up after MAX_TRIES (distinct from a valid "no PTR" reply).
-async fn lookup(
-    r: &TokioResolver,
-    lim: &Limiter,
-    meter: &Meter,
+/// One server = one resolver = one meter (own adaptive timeout).
+struct Server {
     ip: IpAddr,
-) -> (IpAddr, Option<Vec<String>>) {
+    resolver: TokioResolver,
+    meter: Meter,
+    inflight: AtomicUsize,
+}
+
+/// An attempt in flight on a server; released on drop, also on cancellation.
+struct Slot<'a>(&'a AtomicUsize);
+
+impl Drop for Slot<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Relaxed);
+    }
+}
+
+struct Pool {
+    servers: Vec<Server>,
+    rr: AtomicUsize, // rotates tie-breaks
+}
+
+impl Pool {
+    fn new() -> Self {
+        let servers = RESOLVERS
+            .iter()
+            .map(|&ip| Server {
+                ip,
+                resolver: build_resolver(ip),
+                meter: Meter::default(),
+                inflight: 0.into(),
+            })
+            .collect();
+        Self { servers, rr: 0.into() }
+    }
+
+    /// Least-loaded server not in `tried`; marks the attempt as in flight.
+    fn pick(&self, tried: u64) -> Option<(usize, &Server, Slot<'_>)> {
+        let n = self.servers.len();
+        let off = self.rr.fetch_add(1, Relaxed);
+        let mut best: Option<(usize, &Server)> = None;
+        for i in 0..n {
+            let idx = (off + i) % n;
+            if (tried >> idx) & 1 == 1 {
+                continue;
+            }
+            let s = &self.servers[idx];
+            if best.is_none_or(|(_, b)| s.inflight.load(Relaxed) < b.inflight.load(Relaxed)) {
+                best = Some((idx, s));
+            }
+        }
+        best.map(|(i, s)| {
+            s.inflight.fetch_add(1, Relaxed);
+            (i, s, Slot(&s.inflight))
+        })
+    }
+
+    fn sum(&self, f: impl Fn(&Meter) -> u64) -> u64 {
+        self.servers.iter().map(|s| f(&s.meter)).sum()
+    }
+
+    fn avg_ms(&self) -> f64 {
+        let us = self.sum(|m| m.sum_us.load(Relaxed));
+        let n = self.sum(|m| m.n.load(Relaxed));
+        us as f64 / n.max(1) as f64 / 1000.0
+    }
+}
+
+/// `None` = gave up after MAX_TRIES (distinct from a valid "no PTR" reply).
+async fn lookup(pool: &Pool, lim: &Limiter, ip: IpAddr) -> (IpAddr, Option<Vec<String>>) {
     let (permit, seen) = lim.acquire().await;
-    let mut result = None;
+    let (mut tried, mut result) = (0u64, None);
     for _ in 0..MAX_TRIES {
+        let Some((i, s, _slot)) = pool.pick(tried) else { break };
+        tried |= 1u64 << i;
+
         let t0 = Instant::now();
-        let attempt = match tokio::time::timeout(meter.timeout(), r.reverse_lookup(ip)).await {
+        let attempt = match tokio::time::timeout(s.meter.timeout(), s.resolver.reverse_lookup(ip)).await {
             Ok(res) => classify(res),
             Err(_) => Attempt::Retry(Cause::Timeout),
         };
         match attempt {
             Attempt::Reply(names) => {
-                meter.record(t0.elapsed());
+                s.meter.record(t0.elapsed());
                 lim.on_success();
                 result = Some(names);
                 break;
             }
             Attempt::Retry(cause) => {
-                meter.fail(cause);
+                s.meter.fail(cause);
                 lim.on_backoff(seen);
             }
         }
@@ -261,15 +339,15 @@ async fn main() {
         std::process::exit(2);
     }
 
-    let resolver = build_resolver();
-    let (lim, meter) = (Limiter::new(), Meter::default());
+    let pool = Pool::new();
+    let lim = Limiter::new();
     let started = Instant::now();
     let (mut inp, mut out, mut fail) = (0u64, 0u64, 0u64);
 
     let mut w = BufWriter::new(io::stdout().lock());
     let mut results = pin!(
         ips()
-            .map(|ip| lookup(&resolver, &lim, &meter, ip))
+            .map(|ip| lookup(&pool, &lim, ip))
             .buffer_unordered(MAX_CON)
     );
 
@@ -293,9 +371,19 @@ async fn main() {
     eprintln!(
         "\nInp: {inp} | Out: {out} | Fail: {fail} | Time: {:.3}s | Lat: {:.3}ms | Con: {} | Tmo: {} | Err: {}",
         started.elapsed().as_secs_f64(),
-        meter.avg_ms(),
+        pool.avg_ms(),
         lim.avg_con(),
-        meter.tmo.load(Relaxed),
-        meter.err.load(Relaxed),
+        pool.sum(|m| m.tmo.load(Relaxed)),
+        pool.sum(|m| m.err.load(Relaxed)),
     );
+    for s in &pool.servers {
+        let m = &s.meter;
+        let (ok, tmo, err) = (m.n.load(Relaxed), m.tmo.load(Relaxed), m.err.load(Relaxed));
+        eprintln!(
+            "  {:<15} Req: {} | Tmo: {tmo} | Err: {err} | Lat: {:.3}ms",
+            s.ip.to_string(),
+            ok + tmo + err,
+            m.avg_ms(),
+        );
+    }
 }
