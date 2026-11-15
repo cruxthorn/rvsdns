@@ -22,14 +22,14 @@ use tokio::{
     sync::{Semaphore, SemaphorePermit},
 };
 
-const MIN_CON: usize = 256;
-const START_CON: usize = 512;
-const MAX_CON: usize = 4096; // ulimit -n 65535
-const MAX_TRIES: usize = 3; // 1 attempt + max 2 retries
+const MIN_CON: usize = 32;
+const START_CON: usize = 64;
+const MAX_CON: usize = 256;
+const MAX_TRIES: usize = 2; // 1 attempt + 1 retry on another server
 
-const BOOT_TIMEOUT: Duration = Duration::from_millis(1500);
-const MIN_TIMEOUT: Duration = Duration::from_millis(800);
-const MAX_TIMEOUT: Duration = Duration::from_millis(2500);
+const BOOT_TIMEOUT: Duration = Duration::from_millis(500);
+const MIN_TIMEOUT: Duration = Duration::from_millis(300);
+const MAX_TIMEOUT: Duration = Duration::from_millis(1200);
 
 const USAGE: &str = "rvsdns - fast reverse DNS lookup (Direct STDIN only)\n";
 const RESOLVERS: [IpAddr; 10] = [
