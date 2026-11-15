@@ -184,8 +184,8 @@ impl Limiter {
 
 #[derive(Default)]
 struct Meter {
-    srtt_us: AtomicU64,
-    rttvar_us: AtomicU64,
+    /// High 32 bits: smoothed RTT in microseconds. Low 32 bits: RTT variance.
+    rtt: AtomicU64,
     sum_us: AtomicU64,
     n: AtomicU64,
     tmo: AtomicU64,
@@ -194,26 +194,41 @@ struct Meter {
 
 impl Meter {
     fn record(&self, d: Duration) {
-        let us = d.as_micros() as u64;
+        let us = u64::try_from(d.as_micros())
+            .unwrap_or(u64::MAX)
+            .clamp(1, u32::MAX as u64);
         self.sum_us.fetch_add(us, Relaxed);
         self.n.fetch_add(1, Relaxed);
-        let s = self.srtt_us.load(Relaxed);
-        if s == 0 {
-            self.srtt_us.store(us, Relaxed);
-            self.rttvar_us.store(us / 2, Relaxed);
-        } else {
-            let v = self.rttvar_us.load(Relaxed);
-            self.rttvar_us.store((v * 3 + s.abs_diff(us)) / 4, Relaxed);
-            self.srtt_us.store((s * 7 + us) / 8, Relaxed);
+
+        // SRTT and RTTVAR are one value: update both in a single CAS so that
+        // concurrent replies cannot mix values from different samples.
+        let mut st = self.rtt.load(Relaxed);
+        loop {
+            let s = st >> 32;
+            let v = st & 0xffff_ffff;
+            let next = if s == 0 {
+                (us << 32) | (us / 2)
+            } else {
+                let delta = s.abs_diff(us);
+                let v = ((v * 3 + delta) / 4).min(u32::MAX as u64);
+                let s = ((s * 7 + us) / 8).min(u32::MAX as u64);
+                (s << 32) | v
+            };
+            match self.rtt.compare_exchange_weak(st, next, Relaxed, Relaxed) {
+                Ok(_) => return,
+                Err(actual) => st = actual,
+            }
         }
     }
 
     fn timeout(&self) -> Duration {
-        match self.srtt_us.load(Relaxed) {
-            0 => BOOT_TIMEOUT,
-            s => Duration::from_micros(s + 4 * self.rttvar_us.load(Relaxed))
-                .clamp(MIN_TIMEOUT, MAX_TIMEOUT),
+        let st = self.rtt.load(Relaxed);
+        let s = st >> 32;
+        if s == 0 {
+            return BOOT_TIMEOUT;
         }
+        let v = st & 0xffff_ffff;
+        Duration::from_micros(s + 4 * v).clamp(MIN_TIMEOUT, MAX_TIMEOUT)
     }
 
     fn avg_ms(&self) -> f64 {
