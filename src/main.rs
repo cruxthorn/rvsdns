@@ -2,24 +2,26 @@
 //! Pipeline: STDIN -> parse -> adaptive resolve -> STDOUT. Bench -> STDERR.
 
 use std::{
+    collections::HashMap,
     io::{self, BufWriter, IsTerminal, Write},
-    net::{IpAddr, Ipv4Addr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     pin::pin,
-    sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering::Relaxed},
+    },
     time::{Duration, Instant},
 };
 
 use futures::{Stream, StreamExt, stream};
-use hickory_net::{NetError, runtime::TokioRuntimeProvider};
-use hickory_proto::rr::RData;
-use hickory_resolver::{
-    Resolver, TokioResolver,
-    config::{NameServerConfig, ResolverConfig},
-    lookup::Lookup,
+use hickory_proto::{
+    op::{Message, MessageType, OpCode, Query, ResponseCode},
+    rr::{Name, RData, RecordType},
 };
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
-    sync::{Semaphore, SemaphorePermit},
+    net::UdpSocket,
+    sync::{Semaphore, SemaphorePermit, oneshot},
 };
 
 const MIN_CON: usize = 32;
@@ -30,6 +32,9 @@ const MAX_TRIES: usize = 2; // 1 attempt + 1 retry on another server
 const BOOT_TIMEOUT: Duration = Duration::from_millis(500);
 const MIN_TIMEOUT: Duration = Duration::from_millis(300);
 const MAX_TIMEOUT: Duration = Duration::from_millis(1200);
+
+const SOCKETS_PER_SERVER: usize = 4;
+const RECV_BUF: usize = 4096;
 
 const USAGE: &str = "rvsdns - fast reverse DNS lookup (Direct STDIN only)\n";
 const RESOLVERS: [IpAddr; 10] = [
@@ -245,23 +250,14 @@ impl Meter {
 
 // ─────────────────────── resolver ───────────────────────
 
-
-/// What one attempt told us.
-enum Attempt {
-    /// Valid reply, final. Empty = NXDOMAIN/NODATA.
-    Reply(Vec<String>),
-    /// No usable reply; back off and try again.
-    Retry(Cause),
-}
-
 #[derive(Clone, Copy)]
 enum Cause {
     Timeout, // our deadline or the resolver's own
     Server,  // SERVFAIL, REFUSED, busy, I/O, protocol...
 }
 
-fn ptr_names(l: &Lookup) -> Vec<String> {
-    l.answers()
+fn ptr_names(msg: &Message) -> Vec<String> {
+    msg.answers
         .iter()
         .filter_map(|rec| match &rec.data {
             RData::PTR(p) => Some(p.0.to_utf8().trim_end_matches('.').to_owned()),
@@ -270,33 +266,198 @@ fn ptr_names(l: &Lookup) -> Vec<String> {
         .collect()
 }
 
-fn classify(res: Result<Lookup, NetError>) -> Attempt {
-    match res {
-        Ok(l) => Attempt::Reply(ptr_names(&l)),
-        Err(e) if e.is_no_records_found() => Attempt::Reply(vec![]),
-        Err(NetError::Timeout) => Attempt::Retry(Cause::Timeout),
-        Err(_) => Attempt::Retry(Cause::Server),
+fn reply_from(msg: Message) -> Result<Vec<String>, Cause> {
+    if msg.metadata.truncation {
+        return Err(Cause::Server); // let the retry use another server
+    }
+    match msg.metadata.response_code {
+        ResponseCode::NoError => Ok(ptr_names(&msg)),
+        ResponseCode::NXDomain => Ok(Vec::new()),
+        _ => Err(Cause::Server),
     }
 }
 
 const _: () = assert!(RESOLVERS.len() <= 64); // `tried` is a u64 bitmask
 
-fn build_resolver(ip: IpAddr) -> TokioResolver {
-    let config = ResolverConfig::from_name_servers(vec![NameServerConfig::udp_and_tcp(ip)]);
-    let mut b = Resolver::builder_with_config(config, TokioRuntimeProvider::default());
-    let o = b.options_mut();
-    o.cache_size = 0;
-    o.timeout = MAX_TIMEOUT * 2; // outer adaptive timeout always fires first
-    o.attempts = 0; // retries are ours, on another server
-    b.build().expect("cannot build resolver")
+/// One request waiting for its reply on a shared socket.
+struct Pending {
+    query: Name,
+    generation: u64,
+    tx: oneshot::Sender<Message>,
 }
 
-/// One server = one resolver = one meter (own adaptive timeout).
+impl Pending {
+    fn matches(&self, msg: &Message) -> bool {
+        msg.queries.len() == 1
+            && msg.queries[0].name == self.query
+            && msg.queries[0].query_type() == RecordType::PTR
+    }
+}
+
+/// A UDP socket shared by every query sent to one nameserver address.
+///
+/// hickory 0.26 opens a fresh socket for every request, which means a fresh
+/// source port and NAT flow for every lookup and every internal retry. At a few
+/// hundred queries per second that exhausts the NAT table and replies are lost.
+/// Here each socket owns the map of in-flight IDs: one recv loop demultiplexes
+/// every reply, so a small fixed set of flows carries the whole run.
+struct Channel {
+    sock: Arc<UdpSocket>,
+    server: SocketAddr,
+    pending: Mutex<HashMap<u16, Pending>>,
+    next_id: AtomicU16,
+    next_generation: AtomicU64,
+    inflight: AtomicUsize,
+}
+
+impl Channel {
+    async fn new(server: SocketAddr) -> Self {
+        let bind = match server {
+            SocketAddr::V4(_) => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+            SocketAddr::V6(_) => SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
+        };
+        let sock = Arc::new(UdpSocket::bind(bind).await.expect("cannot bind UDP socket"));
+        Self {
+            sock,
+            server,
+            pending: Mutex::new(HashMap::new()),
+            next_id: 0.into(),
+            next_generation: 0.into(),
+            inflight: 0.into(),
+        }
+    }
+
+    async fn query(&self, ip: IpAddr) -> Result<Vec<String>, Cause> {
+        let name = Name::from(ip);
+        let Some((id, generation, rx)) = self.register(name.clone()) else {
+            return Err(Cause::Server);
+        };
+        let _guard = PendingGuard {
+            chan: self,
+            id,
+            generation,
+        };
+
+        let mut msg = Message::new(id, MessageType::Query, OpCode::Query);
+        msg.metadata.recursion_desired = true;
+        msg.add_query(Query::query(name, RecordType::PTR));
+        let bytes = msg.to_vec().map_err(|_| Cause::Server)?;
+
+        self.sock
+            .send_to(&bytes, self.server)
+            .await
+            .map_err(|_| Cause::Server)?;
+
+        let reply = rx.await.map_err(|_| Cause::Server)?;
+        reply_from(reply)
+    }
+
+    fn register(&self, query: Name) -> Option<(u16, u64, oneshot::Receiver<Message>)> {
+        let (tx, rx) = oneshot::channel();
+        let generation = self.next_generation.fetch_add(1, Relaxed);
+        let mut pending = self.pending.lock().expect("pending map poisoned");
+        for _ in 0..=u16::MAX {
+            let id = self.next_id.fetch_add(1, Relaxed);
+            if let std::collections::hash_map::Entry::Vacant(e) = pending.entry(id) {
+                e.insert(Pending {
+                    query,
+                    generation,
+                    tx,
+                });
+                return Some((id, generation, rx));
+            }
+        }
+        None
+    }
+
+    fn forget(&self, id: u16, generation: u64) {
+        let Ok(mut pending) = self.pending.lock() else {
+            return;
+        };
+        if pending.get(&id).is_some_and(|p| p.generation == generation) {
+            pending.remove(&id);
+        }
+    }
+}
+
+/// Removes a pending entry when the request is cancelled or times out.
+struct PendingGuard<'a> {
+    chan: &'a Channel,
+    id: u16,
+    generation: u64,
+}
+
+impl Drop for PendingGuard<'_> {
+    fn drop(&mut self) {
+        self.chan.forget(self.id, self.generation);
+    }
+}
+
+async fn recv_loop(chan: Arc<Channel>) {
+    let mut buf = vec![0u8; RECV_BUF];
+    loop {
+        let Ok((len, src)) = chan.sock.recv_from(&mut buf).await else {
+            continue;
+        };
+        if src.ip() != chan.server.ip() || src.port() != chan.server.port() {
+            continue;
+        }
+        let Ok(msg) = Message::from_vec(&buf[..len]) else {
+            continue;
+        };
+        if msg.metadata.message_type != MessageType::Response {
+            continue;
+        }
+
+        let mut pending = chan.pending.lock().expect("pending map poisoned");
+        let matches = pending
+            .get(&msg.metadata.id)
+            .is_some_and(|p| p.matches(&msg));
+        if !matches {
+            continue;
+        }
+        let p = pending.remove(&msg.metadata.id).expect("checked above");
+        drop(pending);
+        let _ = p.tx.send(msg);
+    }
+}
+
+/// One server = one meter (own adaptive timeout) + a few shared sockets.
 struct Server {
     ip: IpAddr,
-    resolver: TokioResolver,
+    channels: Vec<Arc<Channel>>,
     meter: Meter,
     inflight: AtomicUsize,
+}
+
+impl Server {
+    async fn new(ip: IpAddr) -> Self {
+        let addr = SocketAddr::new(ip, 53);
+        let mut channels = Vec::with_capacity(SOCKETS_PER_SERVER);
+        for _ in 0..SOCKETS_PER_SERVER {
+            let chan = Arc::new(Channel::new(addr).await);
+            tokio::spawn(recv_loop(Arc::clone(&chan)));
+            channels.push(chan);
+        }
+        Self {
+            ip,
+            channels,
+            meter: Meter::default(),
+            inflight: 0.into(),
+        }
+    }
+
+    async fn query(&self, ip: IpAddr) -> Result<Vec<String>, Cause> {
+        let Some(chan) = self
+            .channels
+            .iter()
+            .min_by_key(|c| c.inflight.load(Relaxed))
+        else {
+            return Err(Cause::Server);
+        };
+        let _slot = Slot(&chan.inflight);
+        chan.query(ip).await
+    }
 }
 
 /// An attempt in flight on a server; released on drop, also on cancellation.
@@ -314,17 +475,15 @@ struct Pool {
 }
 
 impl Pool {
-    fn new() -> Self {
-        let servers = RESOLVERS
-            .iter()
-            .map(|&ip| Server {
-                ip,
-                resolver: build_resolver(ip),
-                meter: Meter::default(),
-                inflight: 0.into(),
-            })
-            .collect();
-        Self { servers, rr: 0.into() }
+    async fn new() -> Self {
+        let mut servers = Vec::with_capacity(RESOLVERS.len());
+        for &ip in &RESOLVERS {
+            servers.push(Server::new(ip).await);
+        }
+        Self {
+            servers,
+            rr: 0.into(),
+        }
     }
 
     /// Least-loaded server not in `tried`; marks the attempt as in flight.
@@ -368,18 +527,18 @@ async fn lookup(pool: &Pool, lim: &Limiter, ip: IpAddr) -> (IpAddr, Option<Vec<S
         tried |= 1u64 << i;
 
         let t0 = Instant::now();
-        let attempt = match tokio::time::timeout(s.meter.timeout(), s.resolver.reverse_lookup(ip)).await {
-            Ok(res) => classify(res),
-            Err(_) => Attempt::Retry(Cause::Timeout),
+        let attempt = match tokio::time::timeout(s.meter.timeout(), s.query(ip)).await {
+            Ok(res) => res,
+            Err(_) => Err(Cause::Timeout),
         };
         match attempt {
-            Attempt::Reply(names) => {
+            Ok(names) => {
                 s.meter.record(t0.elapsed());
                 lim.on_success();
                 result = Some(names);
                 break;
             }
-            Attempt::Retry(cause) => {
+            Err(cause) => {
                 s.meter.fail(cause);
                 lim.on_backoff(seen);
             }
@@ -402,7 +561,7 @@ async fn main() {
         std::process::exit(2);
     }
 
-    let pool = Pool::new();
+    let pool = Pool::new().await;
     let lim = Limiter::new();
     let started = Instant::now();
     let (mut inp, mut out, mut fail) = (0u64, 0u64, 0u64);
