@@ -72,9 +72,10 @@ fn ips() -> impl Stream<Item = IpAddr> {
 
 struct Limiter {
     sem: Semaphore,
-    limit: AtomicUsize,  // target concurrency
-    live: AtomicUsize,   // permits that currently exist
-    streak: AtomicUsize, // successes since last increase
+    /// High 32 bits: target concurrency. Low 32 bits: successes since the last increase.
+    /// Keeping both in one word makes the read-modify-write below a single atomic step.
+    state: AtomicU64,
+    live: AtomicUsize, // permits that currently exist
     con_sum: AtomicU64,
     con_n: AtomicU64,
 }
@@ -83,12 +84,15 @@ impl Limiter {
     fn new() -> Self {
         Self {
             sem: Semaphore::new(START_CON),
-            limit: START_CON.into(),
+            state: ((START_CON as u64) << 32).into(),
             live: START_CON.into(),
-            streak: 0.into(),
             con_sum: 0.into(),
             con_n: 0.into(),
         }
+    }
+
+    fn limit(&self) -> usize {
+        (self.state.load(Relaxed) >> 32) as usize
     }
 
     /// Returns the permit and the limit observed at start.
@@ -97,34 +101,78 @@ impl Limiter {
         let in_flight = self.live.load(Relaxed).saturating_sub(self.sem.available_permits());
         self.con_sum.fetch_add(in_flight as u64, Relaxed);
         self.con_n.fetch_add(1, Relaxed);
-        (p, self.limit.load(Relaxed))
+        (p, self.limit())
     }
 
     /// Release; surplus permits (after a shrink) are forgotten instead of returned.
     fn release(&self, p: SemaphorePermit<'_>) {
-        if self.live.load(Relaxed) > self.limit.load(Relaxed) {
-            self.live.fetch_sub(1, Relaxed);
-            p.forget();
+        let mut live = self.live.load(Relaxed);
+        loop {
+            // Several tasks can release at once after a shrink. Only drop a permit while
+            // `live` is still above the current limit, otherwise we would undershoot it.
+            if live <= self.limit() {
+                return;
+            }
+            match self
+                .live
+                .compare_exchange_weak(live, live - 1, Relaxed, Relaxed)
+            {
+                Ok(_) => {
+                    p.forget();
+                    return;
+                }
+                Err(actual) => live = actual,
+            }
         }
     }
 
     /// Additive increase: +1 per `limit` successes.
     fn on_success(&self) {
-        let l = self.limit.load(Relaxed);
-        if l < MAX_CON && self.streak.fetch_add(1, Relaxed) + 1 >= l {
-            self.streak.store(0, Relaxed);
-            self.limit.fetch_add(1, Relaxed);
-            self.live.fetch_add(1, Relaxed);
-            self.sem.add_permits(1);
+        let mut st = self.state.load(Relaxed);
+        loop {
+            let limit = (st >> 32) as usize;
+            if limit >= MAX_CON {
+                return;
+            }
+            let streak = st as u32 as usize + 1;
+            let grow = streak >= limit;
+            let next = if grow {
+                (limit as u64 + 1) << 32
+            } else {
+                ((limit as u64) << 32) | streak as u64
+            };
+            match self.state.compare_exchange_weak(st, next, Relaxed, Relaxed) {
+                Ok(_) => {
+                    if grow {
+                        self.live.fetch_add(1, Relaxed);
+                        self.sem.add_permits(1);
+                    }
+                    return;
+                }
+                Err(actual) => st = actual,
+            }
         }
     }
 
     /// Multiplicative decrease on any loss signal, once per congestion event.
     fn on_backoff(&self, seen: usize) {
-        let _ = self
-            .limit
-            .compare_exchange(seen, (seen * 7 / 8).max(MIN_CON), Relaxed, Relaxed);
-        self.streak.store(0, Relaxed);
+        let next = (seen * 7 / 8).max(MIN_CON);
+        if next >= seen {
+            return;
+        }
+        let mut st = self.state.load(Relaxed);
+        loop {
+            if (st >> 32) as usize != seen {
+                return; // another task already reacted to this congestion window
+            }
+            match self
+                .state
+                .compare_exchange_weak(st, (next as u64) << 32, Relaxed, Relaxed)
+            {
+                Ok(_) => return,
+                Err(actual) => st = actual,
+            }
+        }
     }
 
     fn avg_con(&self) -> u64 {
